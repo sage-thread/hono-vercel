@@ -7,6 +7,9 @@ export const config = {
 
 const app = new Hono();
 
+const allowedDomains = ["pixeldrain.com", "cdn.pixeldrain.com"];
+const allowedASNs = ["AS13335", "AS812"]; // Cloudflare + Rogers
+
 // Utilities
 function isPrivateIp(ip: string) {
   return (
@@ -18,55 +21,39 @@ function isPrivateIp(ip: string) {
   );
 }
 
-function getClientIpFromHeaders(c: any): string | null {
-  // Edge runtime headers (Web Request)
+function getClientIp(c: any): string | null {
   const xf = c.req.header("x-forwarded-for");
   const xr = c.req.header("x-real-ip");
-  const ip = xf?.split(",")[0]?.trim() || xr?.trim() || null;
-  return ip;
+  return xf?.split(",")[0]?.trim() || xr?.trim() || null;
 }
 
-// IP/ASN filter
+async function fetchASN(ip: string, timeoutMs = 3000): Promise<string | null> {
+  const res = await fetch(`https://ipapi.co/${ip}/json/`, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.asn ?? null;
+}
+
+// IP + ASN check
 app.use("*", async (c, next) => {
-  const ip = getClientIpFromHeaders(c);
+  const ip = getClientIp(c);
+  if (!ip) return c.text("No IP detected", 403);
 
-  if (!ip) {
-    return c.text(
-      "We’re not live in your region yet, but stay tuned for future availability.",
-      403
-    );
-  }
-
-  // Allow private IPs for local dev and internal traffic
-  if (isPrivateIp(ip)) {
-    return await next();
-  }
-
-  try {
-    const res = await fetch(`https://ipapi.co/${ip}/json/`);
-    if (!res.ok) {
-      return c.text(
-        "We’re not live in your region yet, but stay tuned for future availability.",
-        403
-      );
+  if (!isPrivateIp(ip)) {
+    try {
+      const asn = await fetchASN(ip);
+      if (!asn || !allowedASNs.includes(asn)) {
+        return c.text("We’re not live in your region yet", 403);
+      }
+    } catch (err) {
+      console.error("ASN lookup error:", err);
+      return c.text("ASN lookup timed out", 403);
     }
-
-    const { asn } = await res.json();
-    const allowedASNs = ["AS13335", "AS812"]; // Cloudflare + Rogers
-    if (!allowedASNs.includes(asn)) {
-      return c.text(
-        "We’re not live in your region yet, but stay tuned for future availability.",
-        403
-      );
-    }
-
-    await next();
-  } catch {
-    return c.text(
-      "We’re not live in your region yet, but stay tuned for future availability.",
-      403
-    );
   }
+
+  await next();
 });
 
 // Root
@@ -74,40 +61,21 @@ app.get("/", (c) => c.text("Hello Hono + Vercel Edge!"));
 
 // IP diagnostic route
 app.get("/ip", async (c) => {
-  const ip = getClientIpFromHeaders(c);
+  const ip = getClientIp(c);
+  if (!ip) return c.json({ error: "No IP detected" }, 403);
 
-  if (!ip) {
-    return c.json({ error: "No IP detected" }, { status: 403 });
-  }
-
-  const privateIp = isPrivateIp(ip);
   let asn: string | null = null;
-
-try {
-  const res = await fetch(`https://ipapi.co/${ip}/json/`);
-  if (res.ok) {
-    const data = await res.json();
-    asn = data.asn || null;
-  } else {
-    return c.text("Failed to fetch ASN info", 502);
+  try {
+    asn = await fetchASN(ip);
+  } catch (err) {
+    console.error("ASN lookup failed:", err);
   }
-} catch (err) {
-  console.error("ASN lookup failed:", err);
-  return c.text("Error looking up IP information", 502);
-}
-
-
-  const allowedASNs = ["AS13335", "AS812"];
-  const allowed = privateIp || (asn && allowedASNs.includes(asn));
 
   return c.json({
     ip,
-    private: privateIp,
+    private: isPrivateIp(ip),
     asn,
-    allowed,
-    message: allowed
-      ? "IP is allowed"
-      : "We’re not live in your region yet, but stay tuned for future availability.",
+    allowed: isPrivateIp(ip) || !!(asn && allowedASNs.includes(asn)),
   });
 });
 
@@ -117,73 +85,58 @@ app.get("/api", async (c) => {
   const id = c.req.query("id");
 
   let targetUrl: string | null = null;
-  if (origin) {
-    targetUrl = origin;
-  } else if (id) {
-    targetUrl = `https://pixeldrain.com/api/file/${id}?download`;
-  }
+  if (origin) targetUrl = origin;
+  else if (id) targetUrl = `https://pixeldrain.com/api/file/${id}?download`;
 
   if (!targetUrl) {
-    return c.json({ error: "Missing required parameter" }, { status: 400 });
+    return c.json({ error: "Missing required parameter" }, 400);
   }
 
   const parsedUrl = new URL(targetUrl);
-  const allowedHosts = [
-    "pixeldrain.com",
-    "pixeldra.in",
-    "pixeldrain.net",
-    "pixeldrain.dev",
-  ];
-  const isAllowedHost = allowedHosts.some(
-    (host) =>
-      parsedUrl.hostname === host || parsedUrl.hostname.endsWith(`.${host}`)
+  const isAllowedHost = allowedDomains.some(
+    (host) => parsedUrl.hostname === host || parsedUrl.hostname.endsWith(`.${host}`)
   );
-
   if (!isAllowedHost) {
-    return c.json({ error: "Domain not allowed" }, { status: 403 });
+    return c.json({ error: "Domain not allowed" }, 403);
   }
 
-  const response = await fetch(targetUrl, { redirect: "follow" });
-  if (!response.ok) {
-    return new Response(JSON.stringify({ error: "Failed to fetch file" }), {
-      status: response.status,
-      headers: { "Content-Type": "application/json" },
+  try {
+    const upstream = await fetch(targetUrl, { redirect: "follow" });
+    if (!upstream.ok) {
+      return c.json({ error: "Failed to fetch file" });
+    }
+
+    const contentType =
+      upstream.headers.get("content-type") || "application/octet-stream";
+    const contentDisposition =
+      upstream.headers.get("content-disposition") ||
+      `attachment; filename="${parsedUrl.pathname.split("/").pop()}"`;
+
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: {
+        "Content-Type": contentType,
+        "Content-Disposition": contentDisposition,
+      },
     });
+  } catch (err) {
+    console.error("Proxy fetch error:", err);
+    return c.json({ error: "Proxy error" }, 502);
   }
-
-  const contentType =
-    response.headers.get("content-type") || "application/octet-stream";
-  const contentDisposition =
-    response.headers.get("content-disposition") ||
-    `attachment; filename="${parsedUrl.pathname.split("/").pop()}"`;
-
-  return new Response(response.body, {
-    status: response.status,
-    headers: {
-      "Content-Type": contentType,
-      "Content-Disposition": contentDisposition,
-    },
-  });
 });
 
-// Rate limit info
 app.get("/limit", async (c) => {
-  const res = await fetch("https://pixeldrain.com/api/misc/rate_limits");
-  const data = await res.json();
-
-  const percent = (
-    (data.transfer_limit_used / data.transfer_limit) *
-    100
-  ).toFixed(2);
-  const limitMB = (data.transfer_limit / 1e6).toFixed(2);
-  const usedMB = (data.transfer_limit_used / 1e6).toFixed(2);
-
-  return c.json({
-    page: "Rate Limit Page",
-    transfer_limit_used_percentage: `${percent}%`,
-    transfer_limit: `${limitMB} MB`,
-    transfer_limit_used: `${usedMB} MB`,
-  });
+  try {
+    const res = await fetch("https://pixeldrain.com/api/misc/rate_limits");
+    if (!res.ok) {
+      return c.json({ error: "Failed to fetch rate limits" });
+    }
+    const data = await res.json();
+    return c.json(data, 200);
+  } catch (err) {
+    console.error("Rate limit fetch error:", err);
+    return c.json({ error: "Rate limit fetch error" }, 502);
+  }
 });
 
 export default handle(app);
