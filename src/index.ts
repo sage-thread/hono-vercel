@@ -85,17 +85,18 @@ app.get("/api", async (c) => {
   const id = c.req.query("id");
 
   let targetUrl: string | null = null;
-  if (origin) targetUrl = origin;
-  else if (id) targetUrl = `https://pixeldrain.com/api/file/${id}?download`;
+  if (origin) {
+    targetUrl = origin;
+  } else if (id) {
+    targetUrl = `https://pixeldrain.com/api/file/${id}?download`;
+  }
 
   if (!targetUrl) {
     return c.json({ error: "Missing required parameter" }, 400);
   }
 
   const parsedUrl = new URL(targetUrl);
-  const isAllowedHost = allowedDomains.some(
-    (host) => parsedUrl.hostname === host || parsedUrl.hostname.endsWith(`.${host}`)
-  );
+  const isAllowedHost = allowedDomains.includes(parsedUrl.hostname);
   if (!isAllowedHost) {
     return c.json({ error: "Domain not allowed" }, 403);
   }
@@ -103,21 +104,24 @@ app.get("/api", async (c) => {
   try {
     const upstream = await fetch(targetUrl, { redirect: "follow" });
     if (!upstream.ok) {
-      return c.json({ error: "Failed to fetch file" });
+      return c.text("Failed to fetch file");
     }
 
-    const contentType =
-      upstream.headers.get("content-type") || "application/octet-stream";
+    const headers = new Headers();
+    const contentType = upstream.headers.get("content-type") || "application/octet-stream";
     const contentDisposition =
       upstream.headers.get("content-disposition") ||
       `attachment; filename="${parsedUrl.pathname.split("/").pop()}"`;
 
+    headers.set("Content-Type", contentType);
+    headers.set("Content-Disposition", contentDisposition);
+
+    const length = upstream.headers.get("content-length");
+    if (length) headers.set("Content-Length", length);
+
     return new Response(upstream.body, {
       status: upstream.status,
-      headers: {
-        "Content-Type": contentType,
-        "Content-Disposition": contentDisposition,
-      },
+      headers,
     });
   } catch (err) {
     console.error("Proxy fetch error:", err);
