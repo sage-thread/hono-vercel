@@ -5,16 +5,13 @@ const app = new Hono();
 // Only allow these domains
 const allowedDomains = ["pixeldrain.com", "cdn.pixeldrain.com"];
 
-// Error handler
 function handleError(error: unknown): string {
   if (error instanceof Error) return error.message;
   return "An unexpected error occurred";
 }
 
-// Proxy route
 app.get("/", async (c) => {
   try {
-    // Accept either ?url=... or ?id=...
     const urlParam = c.req.query("url");
     const idParam = c.req.query("id");
 
@@ -23,7 +20,6 @@ app.get("/", async (c) => {
     if (urlParam) {
       targetUrl = urlParam;
     } else if (idParam) {
-      // Construct Pixeldrain API download URL
       targetUrl = `https://pixeldrain.com/api/file/${idParam}?download`;
     } else {
       return c.text("Missing url or id parameter", 400);
@@ -34,17 +30,18 @@ app.get("/", async (c) => {
       return c.text("Domain not allowed", 403);
     }
 
-    // Fetch upstream file, forwarding Range header for resumable downloads
+    const rangeHeader = c.req.header("range") ?? "";
+
     const upstream = await fetch(target.toString(), {
-      headers: {
-        range: c.req.header("range") ?? "",
-      },
+      headers: rangeHeader ? { range: rangeHeader } : {},
     });
+
+    const headers = new Headers(upstream.headers);
 
     // Mirror response: stream body + headers
     return new Response(upstream.body, {
       status: upstream.status,
-      headers: upstream.headers,
+      headers,
     });
   } catch (error) {
     return c.text(`Error: ${handleError(error)}`, 500);
